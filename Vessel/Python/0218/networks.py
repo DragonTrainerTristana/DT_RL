@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from config.config import *
-from utils.functions import log_normal_density
+from config import *
+from functions import log_normal_density
 
 class MessageActor(nn.Module):
     """에이전트간 통신을 위한 메시지를 생성하는 네트워크"""
