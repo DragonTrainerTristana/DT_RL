@@ -1,0 +1,552 @@
+import numpy as np
+import datetime
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import StepLR
+from mlagents_envs.environment import UnityEnvironment, ActionTuple
+from mlagents_envs.side_channel.engine_configuration_channel import EngineConfigurationChannel
+from mlagents_envs.side_channel.environment_parameters_channel import EnvironmentParametersChannel
+from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
+from torch.autograd import Variable
+import math
+from functools import reduce
+import bisect
+
+# 환경 및 학습 하이퍼파라미터 설정
+state_size = 138  # RayPerceptionSensor의 크기
+msg_action_space = 3  # MessageActor의 액션 공간 크기 
+continuous_action_size = 2  # ControlActor의 액션 공간 크기
+frames = 4  # 프레임 수 
+n_agent = 4  # 에이전트 수
+
+# 모델 로드 및 학습 모드 설정
+load_model = False
+train_mode = True
+
+# PPO 하이퍼파라미터
+discount_factor = 0.995
+learning_rate = 3e-4
+n_step = 1000
+batch_size = 2048
+n_epoch = 3
+epsilon = 0.2
+entropy_bonus = 0.01
+critic_loss_weight = 0.5
+
+# 학습 설정
+grad_clip_max_norm = 0.5
+run_step = 30000000 if train_mode else 0
+test_step = 100000
+print_interval = 1000
+save_interval = 30000
+
+# 환경 설정
+env_name = "AirCombatRL"
+date_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+save_path = os.path.join(".", "saved_models", env_name, "PPO", date_time)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def log_normal_density(x, mean, log_std, std):
+    """가우시안 확률 밀도의 로그값을 계산하는 함수 
+    Args:
+        x: 실제 행동 값
+        mean: 평균값
+        log_std: 표준편차의 로그값
+        std: 표준편차
+    
+    Returns:
+        log_density: 확률 밀도의 로그값
+    """
+    variance = std.pow(2)
+    log_density = -(x - mean).pow(2) / (2 * variance) - 0.5 * np.log(2 * np.pi) - log_std
+    log_density = log_density.sum(dim=-1, keepdim=True)
+    return log_density
+
+class RunningMeanStd:
+    """상태 정규화를 위한 이동 평균과 표준편차를 계산하는 클래스"""
+    def __init__(self, epsilon=1e-4, shape=()):
+        self.mean = np.zeros(shape, 'float64')
+        self.var = np.ones(shape, 'float64')
+        self.count = epsilon
+
+    def update(self, x):
+        """새로운 데이터로 평균과 분산 업데이트"""
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """모멘트를 이용한 업데이트 수행"""
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+        new_count = batch_count + self.count
+        self.mean = new_mean
+        self.var = new_var
+        self.count = new_count
+
+def transform_buffer(buff):
+    """경험 버퍼를 학습에 사용할 형태로 변환
+    
+    Args:
+        buff: 수집된 경험 데이터
+        
+    Returns:
+        변환된 배치 데이터들 (상태, 목표, 속도, 행동, 보상, 종료 여부 등)
+    """
+    s_batch, goal_batch, speed_batch = [], [], []
+    a_batch, r_batch, d_batch, l_batch, v_batch = [], [], [], [], []
+    
+    for e in buff:
+        s_temp, goal_temp, speed_temp = [], [], []
+        
+        for state in e[0]:
+            s_temp.append(state[0])
+            goal_temp.append(state[1])
+            speed_temp.append(state[2])
+            
+        s_batch.append(s_temp)
+        goal_batch.append(goal_temp)
+        speed_batch.append(speed_temp)
+        
+        a_batch.append(e[1])
+        r_batch.append(e[2])
+        d_batch.append(e[3])
+        l_batch.append(e[4])
+        v_batch.append(e[5])
+
+    return map(np.asarray, [s_batch, goal_batch, speed_batch, 
+                           a_batch, r_batch, d_batch, l_batch, v_batch])
+
+def calculate_returns(rewards, dones, last_value, values, gamma=0.99):
+    """할인된 리턴값 계산
+    
+    Args:
+        rewards: 각 스텝의 보상
+        dones: 각 스텝의 종료 여부
+        last_value: 마지막 상태의 가치
+        values: 각 상태의 가치 추정값
+        gamma: 할인율
+    
+    Returns:
+        returns: 계산된 할인 리턴값
+    """
+    returns = np.zeros_like(rewards)
+    gae = 0
+    next_value = last_value
+    
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+        gae = delta + gamma * 0.95 * (1 - dones[t]) * gae
+        returns[t] = gae + values[t]
+        next_value = values[t]
+        
+    return returns
+
+class MessageActor(nn.Module):
+    """에이전트간 통신을 위한 메시지를 생성하는 네트워크
+    
+    각 에이전트가 다른 에이전트들에게 보낼 메시지를 생성합니다.
+    """
+    def __init__(self, frames, msg_action_space, n_agent):
+        super(MessageActor, self).__init__()
+        self.frames = frames
+        self.n_agent = n_agent
+        self.logstd = nn.Parameter(torch.zeros(2*msg_action_space))
+
+        # 상태를 처리하는 CNN 레이어
+        self.act_fea_cv1 = nn.Conv1d(in_channels=frames, out_channels=32, 
+                                    kernel_size=5, stride=2, padding=1)
+        self.act_fea_cv2 = nn.Conv1d(in_channels=32, out_channels=32, 
+                                    kernel_size=3, stride=2, padding=1)
+        
+        # 특징을 처리하는 완전연결 레이어
+        self.act_fc1 = nn.Linear(128*32, 256)
+        self.act_fc2 = nn.Linear(256+2+2, 128)  # 256 + goal(2) + speed(2)
+        
+        # 메시지 생성을 위한 출력 레이어
+        self.actor1 = nn.Linear(128, msg_action_space)  # [0,1] 범위 메시지
+        self.actor2 = nn.Linear(128, msg_action_space)  # [-1,1] 범위 메시지
+
+    def forward(self, x, goal, speed):
+        """순전파 함수
+        
+        Args:
+            x: 상태 입력 (batch_size, frames, state_size)
+            goal: 목표 위치 (batch_size, 2)
+            speed: 현재 속도 (batch_size, 2)
+        """
+        # 입력 처리
+        x = x.view(-1, self.frames, 512)
+        
+        # CNN 특징 추출
+        a = F.relu(self.act_fea_cv1(x))
+        a = F.relu(self.act_fea_cv2(a))
+        a = a.view(a.shape[0], -1)
+        a = F.relu(self.act_fc1(a))
+        a = a.view(-1, self.n_agent, 256)
+
+        # 배치 크기 1인 경우 처리
+        if len(goal.shape) < 3:
+            goal = goal.unsqueeze(0)
+        if len(speed.shape) < 3:
+            speed = speed.unsqueeze(0)
+
+        # 특징, 목표, 속도 결합
+        a = torch.cat((a, goal, speed), dim=-1)
+        a = F.relu(self.act_fc2(a))
+        
+        # 두 가지 타입의 메시지 생성
+        mean1 = F.sigmoid(self.actor1(a))  # [0,1] 범위
+        mean2 = F.tanh(self.actor2(a))     # [-1,1] 범위
+        mean = torch.cat((mean1, mean2), dim=-1)
+
+        # 확률적 메시지 생성
+        logstd = self.logstd.expand_as(mean)
+        std = torch.exp(logstd)
+        action = torch.normal(mean, std)
+
+        # 행동의 로그 확률 계산
+        logprob = log_normal_density(action, mean, std=std, log_std=logstd)
+        
+        return action, logprob, mean
+
+class ControlActor(nn.Module):
+    """실제 행동을 결정하는 네트워크
+    
+    다른 에이전트들의 메시지를 받아 실제 행동을 결정합니다.
+    """
+    def __init__(self, frames, msg_action_space, ctr_action_space, n_agent):
+        super(ControlActor, self).__init__()
+        self.frames = frames
+        self.n_agent = n_agent
+
+        # 관측 상태를 처리하는 CNN
+        self.act_obs_cv1 = nn.Conv1d(in_channels=frames, out_channels=32, 
+                                    kernel_size=5, stride=2, padding=1)
+        self.act_obs_cv2 = nn.Conv1d(in_channels=32, out_channels=32, 
+                                    kernel_size=3, stride=2, padding=1)
+        
+        # 관측 상태 처리를 위한 FC 레이어
+        self.act_obs_fc1 = nn.Linear(128*32, 256)
+        self.act_obs_fc2 = nn.Linear(256+2+2, 128)
+        self.act_obs_fc3 = nn.Linear(128, 4*msg_action_space)
+
+        # 메시지와 상태를 결합하여 행동 생성
+        self.act_fc1 = nn.Linear(4*msg_action_space+4*msg_action_space, 64)
+        self.act_fc2 = nn.Linear(64+2+2, 128)
+        self.mu = nn.Linear(128, ctr_action_space)
+        self.mu.weight.data.mul_(0.1)  # 출력을 작은 범위로 제한
+        self.logstd = nn.Parameter(torch.zeros(ctr_action_space))
+
+    def forward(self, x, goal, speed, y):
+        """순전파 함수
+        
+        Args:
+            x: 메시지 입력
+            goal: 목표 위치
+            speed: 현재 속도
+            y: 관측 상태
+        """
+        # 관측 상태 처리
+        y = y.view(-1, self.frames, 512)
+        a = F.relu(self.act_obs_cv1(y))
+        a = F.relu(self.act_obs_cv2(a))
+        a = a.view(a.shape[0], -1)
+        a = F.relu(self.act_obs_fc1(a))
+        a = a.view(-1, self.n_agent, 256)
+
+        if len(goal.shape) < 3:
+            goal = goal.unsqueeze(0)
+        if len(speed.shape) < 3:
+            speed = speed.unsqueeze(0)
+
+        # 상태, 목표, 속도 결합
+        a = torch.cat((a, goal, speed), dim=-1)
+        a = F.relu(self.act_obs_fc2(a))
+        a = F.relu(self.act_obs_fc3(a))
+
+        # 메시지와 처리된 상태 결합
+        x = torch.cat((a,x), dim=-1)
+        act = self.act_fc1(x)
+        act = act.view(-1, self.n_agent, 64)
+
+        # 최종 행동 생성
+        act = torch.cat((act, goal, speed), dim=-1)
+        act = F.tanh(act)
+        act = self.act_fc2(act)
+        act = F.tanh(act)
+        mean = self.mu(act)
+
+        # 확률적 행동 생성
+        logstd = self.logstd.expand_as(mean)
+        std = torch.exp(logstd)
+        action = torch.normal(mean, std)
+
+        logprob = log_normal_density(action, mean, std=std, log_std=logstd)
+        return action, logprob, mean
+    
+class CNNPolicy(nn.Module):
+
+    def __init__(self, msg_action_space, ctr_action_space, frames, n_agent):
+        super(CNNPolicy, self).__init__()
+        self.frames = frames
+        self.n_agent = n_agent
+        
+        # 메시지 액터와 컨트롤 액터 초기화
+        self.msg_actor = MessageActor(frames, msg_action_space, n_agent)
+        self.ctr_actor = ControlActor(frames, msg_action_space, ctr_action_space, n_agent)
+        self.logstd = nn.Parameter(torch.zeros(ctr_action_space))
+
+        # 크리틱(가치 평가) 네트워크
+        self.crt_fea_cv1 = nn.Conv1d(in_channels=frames, out_channels=32, 
+                                    kernel_size=5, stride=2, padding=1)
+        self.crt_fea_cv2 = nn.Conv1d(in_channels=32, out_channels=32, 
+                                    kernel_size=3, stride=2, padding=1)
+        self.crt_fc1 = nn.Linear(128*32, 256)
+        self.crt_fc2 = nn.Linear(256+2+2, 128)
+        self.critic = nn.Linear(128, 1)  # 가치 출력
+
+    def forward(self, x, goal, speed):
+        """순전파 함수
+        
+        Args:
+            x: 상태 입력
+            goal: 목표 위치
+            speed: 현재 속도
+            
+        Returns:
+            v: 상태 가치
+            action: 선택된 행동
+            logprob: 행동의 로그 확률
+            mean: 행동의 평균값
+        """
+        # 배치 크기 1인 경우 처리
+        if len(x.shape) < 4:
+            x = x.unsqueeze(0)
+            
+        # 1. 메시지 생성
+        msg, _, _ = self.msg_actor(x, goal, speed)
+        
+        # 2. 메시지 처리 (다른 에이전트들의 메시지 합산)
+        ctr_input = msg.sum(dim=1, keepdim=True)  # 모든 메시지 합
+        ctr_input = ctr_input.repeat((1, self.n_agent, 1))  # 각 에이전트에 복제
+        ctr_input = ctr_input - msg  # 자신의 메시지는 제외
+        ctr_input = torch.cat((msg, ctr_input), 2)  # 자신과 다른 에이전트의 메시지 결합
+        
+        # 3. 행동 생성
+        action, logprob, mean = self.ctr_actor(ctr_input, goal, speed, x)
+        
+        # 4. 확률적 행동 샘플링
+        logstd = self.logstd.expand_as(mean)
+        std = torch.exp(logstd)
+        action = torch.normal(mean, std)
+
+        # 5. 상태 가치 계산 (Critic)
+        x = x.view(-1, self.frames, 512)
+        v = F.relu(self.crt_fea_cv1(x))
+        v = F.relu(self.crt_fea_cv2(v))
+        v = v.view(v.shape[0], -1)
+        v = F.relu(self.crt_fc1(v))
+        v = v.view(-1, self.n_agent, 256)
+
+        if len(goal.shape) < 3:
+            goal = goal.unsqueeze(0)
+        if len(speed.shape) < 3:
+            speed = speed.unsqueeze(0)
+
+        v = torch.cat((v, goal, speed), dim=-1)
+        v = F.relu(self.crt_fc2(v))
+        v = self.critic(v)
+
+        # 최종 행동의 로그 확률 계산
+        logprob = log_normal_density(action, mean, std=std, log_std=logstd)
+        return v, action, logprob, mean
+
+    def evaluate_actions(self, x, goal, speed, action):
+        """주어진 행동의 가치와 확률을 평가하는 함수
+        
+        Args:
+            x: 상태
+            goal: 목표 위치
+            speed: 현재 속도
+            action: 평가할 행동
+            
+        Returns:
+            v: 상태 가치
+            logprob: 행동의 로그 확률
+            dist_entropy: 행동 분포의 엔트로피
+        """
+        v, _, _, mean = self.forward(x, goal, speed)
+        logstd = self.logstd.expand_as(mean)
+        std = torch.exp(logstd)
+        
+        # 행동의 로그 확률 계산
+        logprob = log_normal_density(action, mean, log_std=logstd, std=std)
+        
+        # 엔트로피 계산 (탐색의 다양성을 측정)
+        dist_entropy = 0.5 + 0.5 * math.log(2 * math.pi) + logstd
+        dist_entropy = dist_entropy.sum(-1).mean()
+        
+        return v, logprob, dist_entropy
+
+# 추가 학습 파라미터
+max_steps = 1000     # 에피소드당 최대 스텝 수
+num_episodes = run_step // max_steps  # 총 스텝 수를 에피소드 최대 스텝으로 나눔
+update_interval = n_step  # 기존의 n_step을 사용
+value_loss_coef = critic_loss_weight  # 기존의 critic_loss_weight 사용
+entropy_coef = entropy_bonus  # 기존의 entropy_bonus 사용
+max_grad_norm = grad_clip_max_norm  # 기존의 grad_clip_max_norm 사용
+
+# 환경 설정 채널 추가
+channel = EngineConfigurationChannel()
+env = UnityEnvironment(file_name="AirCombatRL", side_channels=[channel], worker_id= 10)
+channel.set_configuration_parameters(time_scale=1.0)
+
+# 정책 네트워크와 옵티마이저 초기화
+policy = CNNPolicy(msg_action_space, continuous_action_size, frames, n_agent).to(device)
+optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
+
+# 메모리 버퍼 클래스
+class Memory:
+    def __init__(self):
+        self.states = []
+        self.goals = []
+        self.speeds = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.values = []
+        self.logprobs = []
+    
+    def clear(self):
+        self.__init__()
+
+    def add(self, state, goal, speed, action, reward, done, value, logprob):
+        self.states.append(state)
+        self.goals.append(goal)
+        self.speeds.append(speed)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.values.append(value)
+        self.logprobs.append(logprob)
+
+# 텐서보드 로깅 설정
+writer = SummaryWriter(log_dir=os.path.join(save_path, 'logs'))
+
+# 학습 루프
+total_steps = 0
+for episode in range(num_episodes):
+    memory = Memory()
+    episode_reward = 0
+    step = 0
+    
+    # 환경 초기화
+    env.reset()
+    behavior_name = list(env.behavior_specs)[0]
+    decision_steps, terminal_steps = env.get_steps(behavior_name)
+    
+    while step < max_steps:
+        # 상태 정보 추출
+        state = decision_steps.obs[0]
+        goal = decision_steps.obs[1]  # 목표 위치
+        speed = decision_steps.obs[2]  # 현재 속도
+        
+        # 행동 선택
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).to(device)
+            goal_tensor = torch.FloatTensor(goal).to(device)
+            speed_tensor = torch.FloatTensor(speed).to(device)
+            value, action, logprob, _ = policy(state_tensor, goal_tensor, speed_tensor)
+        
+        # 환경에 행동 적용
+        action_tuple = ActionTuple(continuous=action.cpu().numpy())
+        env.set_actions(behavior_name, action_tuple)
+        env.step()
+        
+        # 다음 상태 정보 얻기
+        decision_steps, terminal_steps = env.get_steps(behavior_name)
+        
+        # 보상과 종료 여부 처리
+        reward = decision_steps.reward[0] if len(decision_steps) > 0 else terminal_steps.reward[0]
+        done = len(terminal_steps) > 0
+        
+        # 경험 저장
+        memory.add(state, goal, speed, action.cpu().numpy(), 
+                  reward, done, value.cpu().numpy(), logprob.cpu().numpy())
+        
+        episode_reward += reward
+        total_steps += 1
+        step += 1
+        
+        # 업데이트 수행
+        if total_steps % update_interval == 0:
+            # 리턴값 계산
+            returns = calculate_returns(
+                memory.rewards,
+                memory.dones,
+                memory.values[-1],
+                memory.values,
+                gamma=discount_factor
+            )
+            
+            # PPO 업데이트
+            for _ in range(n_epoch):
+                batch_indices = np.random.permutation(len(memory.states))
+                for start in range(0, len(memory.states), batch_size):
+                    end = start + batch_size
+                    batch_idx = batch_indices[start:end]
+                    
+                    # 배치 데이터 준비
+                    states_batch = torch.FloatTensor(memory.states[batch_idx]).to(device)
+                    goals_batch = torch.FloatTensor(memory.goals[batch_idx]).to(device)
+                    speeds_batch = torch.FloatTensor(memory.speeds[batch_idx]).to(device)
+                    actions_batch = torch.FloatTensor(memory.actions[batch_idx]).to(device)
+                    returns_batch = torch.FloatTensor(returns[batch_idx]).to(device)
+                    old_logprobs_batch = torch.FloatTensor(memory.logprobs[batch_idx]).to(device)
+                    
+                    # PPO 업데이트
+                    values, logprobs, dist_entropy = policy.evaluate_actions(
+                        states_batch, goals_batch, speeds_batch, actions_batch
+                    )
+                    
+                    ratio = torch.exp(logprobs - old_logprobs_batch)
+                    advantage = returns_batch - values
+                    
+                    surr1 = ratio * advantage
+                    surr2 = torch.clamp(ratio, 1-epsilon, 1+epsilon) * advantage
+                    
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    value_loss = F.mse_loss(values, returns_batch)
+                    loss = policy_loss + value_loss_coef * value_loss - entropy_coef * dist_entropy
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                    optimizer.step()
+            
+            memory.clear()
+        
+        if done:
+            break
+    
+    # 로깅
+    writer.add_scalar('Reward/Episode', episode_reward, episode)
+    print(f"Episode {episode}, Steps: {step}, Reward: {episode_reward:.2f}")
+    
+    # 모델 저장
+    if episode % save_interval == 0:
+        torch.save(policy.state_dict(), 
+                  os.path.join(save_path, f'policy_episode_{episode}.pth'))
+
+# 환경 종료
+env.close()
